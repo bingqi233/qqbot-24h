@@ -196,19 +196,38 @@ class Brain:
             "messages": messages,
             "temperature": 0.7,
             "stream": False,
+            "max_tokens": 1024,
         }
+        # GLM-4.7-Flash 默认是「混合思考」模型，思考链会把正文挤掉、也更容易被限流
+        if os.getenv("DISABLE_THINKING", "1") != "0":
+            payload["thinking"] = {"type": "disabled"}
+
         headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-        try:
-            async with httpx.AsyncClient(timeout=60) as c:
-                r = await c.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload)
+        data = None
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=60) as c:
+                    r = await c.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload)
+                if r.status_code == 429 or r.status_code >= 500:
+                    LOG.warning("模型限流/异常 %s（第 %s 次），重试中", r.status_code, attempt + 1)
+                    await asyncio.sleep(2 + attempt * 3)
+                    continue
                 if r.status_code >= 400:
                     LOG.warning("模型返回 %s: %s", r.status_code, r.text[:300])
                     return "模型那边出了点问题，稍后再试试～"
                 data = r.json()
-            answer = (data["choices"][0]["message"].get("content") or "").strip()
-        except Exception as e:  # noqa: BLE001
-            LOG.warning("调用模型失败: %r", e)
-            return "我这边卡了一下，等一下再问我吧～"
+                break
+            except Exception as e:  # noqa: BLE001
+                LOG.warning("调用模型失败（第 %s 次）: %r", attempt + 1, e)
+                await asyncio.sleep(2 + attempt * 3)
+
+        if not data:
+            return "我这边有点挤，等一下再问我吧～"
+
+        msg = data["choices"][0]["message"]
+        answer = (msg.get("content") or "").strip()
+        if not answer:
+            answer = (msg.get("reasoning_content") or "").strip()
         if not answer:
             return "嗯…我没想好怎么回，你再说一次？"
         self.mem.append(skey, "user", user_text)
