@@ -35,12 +35,17 @@ APP_SECRET = os.getenv("QQ_APP_SECRET", "").strip()
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "").strip()
-LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.7-flash")
+LLM_MODEL = os.getenv("LLM_MODEL", "glm-4.7")
+# 依次尝试的模型：前面的更强，后面的便宜/免费兜底
+MODEL_CHAIN = [m.strip() for m in os.getenv("LLM_MODEL_CHAIN", "").split(",") if m.strip()] \
+    or [LLM_MODEL, "glm-4-flash", "glm-4.7-flash"]
+HTTP = None          # 全局连接池，避免每条消息重新 TLS 握手
+AUTH_HEADERS = {}
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "你是 QQ 上的聊天助手。回答用中文，口语化、简短自然，一般不超过 150 字；"
-    "除非用户明确要求，不要输出 Markdown 标题、表格或大段代码。",
+    "你是 QQ 上的聊天助手。用中文自然口语回答，该详细就详细，一般不超过 300 字；"
+    "别用 Markdown 标题、表格、编号堆砌；不要一问就敷衍一句。",
 ).strip()
 
 HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))
@@ -191,45 +196,45 @@ class Brain:
         history = self.mem.load(skey, HISTORY_TURNS)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
         messages.append({"role": "user", "content": user_text})
-        payload = {
-            "model": LLM_MODEL,
-            "messages": messages,
-            "temperature": 0.7,
-            "stream": False,
-            "max_tokens": 1024,
-        }
-        # GLM-4.7-Flash 默认是「混合思考」模型，思考链会把正文挤掉、也更容易被限流
-        if os.getenv("DISABLE_THINKING", "1") != "0":
-            payload["thinking"] = {"type": "disabled"}
 
-        headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
-        data = None
-        for attempt in range(3):
-            try:
-                async with httpx.AsyncClient(timeout=60) as c:
-                    r = await c.post(f"{LLM_BASE_URL}/chat/completions", headers=headers, json=payload)
-                if r.status_code == 429 or r.status_code >= 500:
-                    LOG.warning("模型限流/异常 %s（第 %s 次），重试中", r.status_code, attempt + 1)
-                    await asyncio.sleep(2 + attempt * 3)
-                    continue
-                if r.status_code >= 400:
-                    LOG.warning("模型返回 %s: %s", r.status_code, r.text[:300])
-                    return "模型那边出了点问题，稍后再试试～"
-                data = r.json()
+        data, used = None, None
+        for model in MODEL_CHAIN:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": 0.6,
+                "stream": False,
+                "max_tokens": 1024,
+            }
+            if os.getenv("DISABLE_THINKING", "1") != "0":
+                payload["thinking"] = {"type": "disabled"}
+            for attempt in range(2):
+                try:
+                    r = await HTTP.post(f"{LLM_BASE_URL}/chat/completions",
+                                        headers=AUTH_HEADERS, json=payload)
+                    if r.status_code == 200:
+                        data, used = r.json(), model
+                        break
+                    LOG.warning("模型 %s -> %s (第%s次): %s", model, r.status_code,
+                                attempt + 1, r.text[:160])
+                    if r.status_code == 429:
+                        await asyncio.sleep(0.6)   # 同模型快速再试
+                        continue
+                    break                          # 余额/权限/参数问题：换下一个模型
+                except Exception as e:  # noqa: BLE001
+                    LOG.warning("调用 %s 失败(第%s次): %r", model, attempt + 1, e)
+                    await asyncio.sleep(0.6)
+            if data:
                 break
-            except Exception as e:  # noqa: BLE001
-                LOG.warning("调用模型失败（第 %s 次）: %r", attempt + 1, e)
-                await asyncio.sleep(2 + attempt * 3)
 
         if not data:
-            return "我这边有点挤，等一下再问我吧～"
+            return "我这边有点挤，等一会儿再问我～"
 
         msg = data["choices"][0]["message"]
-        answer = (msg.get("content") or "").strip()
-        if not answer:
-            answer = (msg.get("reasoning_content") or "").strip()
+        answer = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
         if not answer:
             return "嗯…我没想好怎么回，你再说一次？"
+        LOG.info("本次回复模型: %s", used)
         self.mem.append(skey, "user", user_text)
         self.mem.append(skey, "assistant", answer)
         return answer
@@ -386,6 +391,9 @@ async def main() -> None:
         LOG.error("缺少 QQ_APP_ID / QQ_APP_SECRET，请检查 .env")
         return
 
+    global HTTP, AUTH_HEADERS
+    HTTP = httpx.AsyncClient(timeout=60, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
+    AUTH_HEADERS = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     tokens = TokenManager()
     api = QQApi(tokens)
     mem = Memory(DB_PATH)
@@ -400,7 +408,7 @@ async def main() -> None:
     await site.start()
     LOG.info("探活服务已启动 :%s", PORT)
 
-    LOG.info("启动机器人 appId=%s model=%s dry_run=%s", APP_ID, LLM_MODEL, DRY_RUN)
+    LOG.info("启动机器人 appId=%s 模型链=%s dry_run=%s", APP_ID, ",".join(MODEL_CHAIN), DRY_RUN)
     await gateway_forever(api, brain)
 
 
