@@ -1,0 +1,106 @@
+name: QQ Bot 24-7
+
+# 触发方式：
+#   1) 手动 / API 触发（主力，运行结束会自动触发下一次，形成无缝接力）
+#   2) 定时兜底（接力链万一断了，6 小时一次自动拉起）
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
+
+# 同一个组串行，绝不允许两个实例同时连 QQ（否则会重复回复）
+concurrency:
+  group: qqbot-24h
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350          # 单次最长 5h50m（GitHub 单 job 上限 6h）
+    steps:
+      - name: 防止重复实例
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          token = os.environ.get("GH_TOKEN", "")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          run_id = int(os.environ.get("GITHUB_RUN_ID", "0"))
+          url = f"https://api.github.com/repos/{repo}/actions/runs?per_page=30"
+          req = urllib.request.Request(url, headers={
+              "Authorization": f"token {token}", "Accept": "application/vnd.github+json",
+              "User-Agent": "qqbot-guard"})
+          try:
+              data = json.load(urllib.request.urlopen(req, timeout=20))
+              others = [r for r in data.get("workflow_runs", [])
+                        if r["id"] != run_id and r["status"] in ("in_progress", "queued")]
+              print("其他在跑/排队实例:", len(others))
+              if len(others) > 0:
+                  print("已有实例在跑，本次退出")
+                  print("skip=1", file=open(os.environ["GITHUB_OUTPUT"], "a"))
+          except Exception as e:
+              print("检查失败，继续运行:", e)
+          PY
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != '1'
+
+      - uses: actions/setup-python@v5
+        if: steps.guard.outputs.skip != '1'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        if: steps.guard.outputs.skip != '1'
+        run: pip install -r requirements.txt
+
+      - name: 恢复聊天记忆
+        if: steps.guard.outputs.skip != '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: qqbot-data-${{ github.run_id }}
+          restore-keys: qqbot-data-
+
+      - name: 运行机器人
+        if: steps.guard.outputs.skip != '1'
+        timeout-minutes: 340
+        env:
+          QQ_APP_ID: ${{ secrets.QQ_APP_ID }}
+          QQ_APP_SECRET: ${{ secrets.QQ_APP_SECRET }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          SYSTEM_PROMPT: ${{ secrets.SYSTEM_PROMPT }}
+          TZ: Asia/Shanghai
+          PORT: "8080"
+        run: |
+          # 跑 5 小时 45 分后自行收尾，给接力留时间
+          timeout 20700 python -u bot.py || echo "机器人进程结束（正常收尾）"
+
+      - name: 保存聊天记忆
+        if: always() && steps.guard.outputs.skip != '1'
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: qqbot-data-${{ github.run_id }}
+
+      - name: 触发下一次运行（接力）
+        if: always() && steps.guard.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 10
+          curl -sS -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: qqbot-chain" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/run.yml/dispatches" \
+            -d '{"ref":"main"}' -o /dev/null -w "下一次触发: %{http_code}\n"
