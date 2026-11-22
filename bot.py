@@ -11,6 +11,7 @@ QQ 官方机器人 + 免费大模型 · 7x24 常驻版
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -44,12 +45,37 @@ AUTH_HEADERS = {}
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "你是 QQ 上的聊天助手。用中文自然口语回答，该详细就详细，一般不超过 300 字；"
-    "别用 Markdown 标题、表格、编号堆砌；不要一问就敷衍一句。",
+    "你在 QQ 上跟人聊天，不是在写报告。用中文，口语化，像真人一样说话，自然换行分段。"
+    "绝对不要用星号、井号、反引号这类排版符号，不要加粗，不要分点罗列。"
+    "对方问什么就答什么：简单问题一两句，复杂问题讲清楚但别啰嗦。"
+    "别说教、别敷衍、别讲套话，别动不动就总结。",
 ).strip()
 
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "8"))
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "12"))
 MAX_REPLY_CHARS = int(os.getenv("MAX_REPLY_CHARS", "1500"))
+
+_MD_PATTERNS = [
+    (re.compile(r"```[A-Za-z0-9_+-]*"), ""),
+    (re.compile(r"^\s{0,3}#{1,6}\s*", re.M), ""),
+    (re.compile(r"\*\*(.+?)\*\*", re.S), r"\1"),
+    (re.compile(r"__(.+?)__", re.S), r"\1"),
+    (re.compile(r"`([^`\n]+)`"), r"\1"),
+    (re.compile(r"^\s{0,3}>\s?", re.M), ""),
+    (re.compile(r"^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$", re.M), ""),
+    (re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)"), r"\1（\2）"),
+    (re.compile(r"^\s{0,3}[*+-]\s+", re.M), "· "),
+    (re.compile(r"[*_]{1,3}"), ""),
+    (re.compile(r"[ \t]+\n"), "\n"),
+    (re.compile(r"\n{3,}"), "\n\n"),
+]
+
+
+def clean_md(text: str) -> str:
+    """把模型输出里的 Markdown 抹成适合 QQ 的纯文本。"""
+    text = (text or "").replace("\r\n", "\n")
+    for pat, rep in _MD_PATTERNS:
+        text = pat.sub(rep, text)
+    return text.strip()
 REPLY_CHUNK = 900
 DRY_RUN = os.getenv("DRY_RUN", "0").strip() == "1"
 PORT = int(os.getenv("PORT", "8080"))
@@ -191,6 +217,7 @@ class Brain:
         return self.queue_locks[skey]
 
     async def chat(self, skey: str, user_text: str) -> str:
+        t0 = time.time()
         if not LLM_API_KEY:
             return "（机器人还没配置模型密钥，请管理员补上 LLM_API_KEY）"
         history = self.mem.load(skey, HISTORY_TURNS)
@@ -204,7 +231,7 @@ class Brain:
                 "messages": messages,
                 "temperature": 0.6,
                 "stream": False,
-                "max_tokens": 1024,
+                "max_tokens": 1500,
             }
             if os.getenv("DISABLE_THINKING", "1") != "0":
                 payload["thinking"] = {"type": "disabled"}
@@ -234,14 +261,16 @@ class Brain:
         answer = (msg.get("content") or "").strip() or (msg.get("reasoning_content") or "").strip()
         if not answer:
             return "嗯…我没想好怎么回，你再说一次？"
-        LOG.info("本次回复模型: %s", used)
+        LOG.info("本次回复模型(base64): %s 耗时=%.1fs 输入%d字 输出%d字 分段=%d",
+                 base64.b64encode(used.encode()).decode(), time.time() - t0,
+                 len(user_text), len(answer), len(self._chunks(answer)))
         self.mem.append(skey, "user", user_text)
         self.mem.append(skey, "assistant", answer)
         return answer
 
     @staticmethod
     def _chunks(text: str):
-        text = text.strip()
+        text = clean_md(text)
         if len(text) > MAX_REPLY_CHARS:
             text = text[:MAX_REPLY_CHARS] + "…"
         out, buf = [], ""
