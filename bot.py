@@ -233,7 +233,8 @@ class Brain:
                 "stream": False,
                 "max_tokens": 1500,
             }
-            if os.getenv("DISABLE_THINKING", "1") != "0":
+            # 只有智谱系接口认 thinking 参数，DeepSeek/OpenAI 兼容端点不能带
+            if os.getenv("DISABLE_THINKING", "1") != "0" and "bigmodel" in LLM_BASE_URL:
                 payload["thinking"] = {"type": "disabled"}
             for attempt in range(2):
                 try:
